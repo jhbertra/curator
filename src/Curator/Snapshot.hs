@@ -145,10 +145,11 @@ instance Exception TraverseValidateExceptions
 
 checkDependencyGraph ::
        (HasTerm env, HasProcessContext env, HasPantryConfig env)
-    => Constraints
+    => Bool
+    -> Constraints
     -> Snapshot
     -> RIO env ()
-checkDependencyGraph constraints snapshot = do
+checkDependencyGraph disable constraints snapshot = do
     let compiler = snapshotCompiler snapshot
         compilerVer = case compiler of
           WCGhc v -> v
@@ -184,11 +185,15 @@ checkDependencyGraph constraints snapshot = do
                 Map.map (piVersion &&& piTreeDeps) pkgInfos
                 <> Map.map ((, []) . Just . bpVersion) ghcBootPackages
           return $ Map.mapWithKey (validatePackage constraints depTree cabalVersion) pkgInfos
-    let (rangeErrors, otherErrors) = splitErrors pkgErrors
-        rangeErrors' =
-          Map.mapWithKey (\(pname, _, _) bs -> (Map.member pname ghcBootPackages0, bs)) rangeErrors
-    unless (Map.null rangeErrors && Map.null otherErrors) $
-      throwM (BrokenDependencyGraph rangeErrors' otherErrors)
+    unless (null pkgErrors) $
+      if disable then
+        throwM . PackageDisablementRequired $ pkgErrors
+      else
+        let (rangeErrors, otherErrors) = splitErrors pkgErrors
+            rangeErrors' =
+              Map.mapWithKey (\(pname, _, _) bs -> (Map.member pname ghcBootPackages0, bs)) rangeErrors
+        in
+        throwM $ BrokenDependencyGraph rangeErrors' otherErrors
 
 data BrokenDependencyGraph = BrokenDependencyGraph
   (Map (PackageName, Set Text, Maybe Version) (Bool, Map DependingPackage DepBounds))
@@ -280,6 +285,48 @@ pkgBoundsError dep maintainers mdepVer isBoot users =
 
     display :: Distribution.Pretty.Pretty a => a -> Text
     display = T.pack . DT.display
+
+newtype PackageDisablementRequired = PackageDisablementRequired [DependencyError]
+
+instance Exception PackageDisablementRequired
+
+instance Show PackageDisablementRequired where
+  show (PackageDisablementRequired errors) = T.unpack . T.unlines $
+    "The following packages have incompatible constraints and need to be disabled:"
+    showRecords "LIBS + EXES" libsExes <>
+    showRecords "TESTS" tests <>
+    showExtra
+    where
+      (rangeErrors, otherErrors) = partitionEithers $ map errorToEither errors
+      errorToEither (RangeError red) = Left red
+      errorToEither (OtherError e) = Right e
+      showRecords title records' =
+        "" :
+        title :
+        "" :
+        map (("        - " <>) . disableConstraint) records'
+      showExtra
+        | null otherErrors = []
+        | otherwise =
+          [ ""
+          , "Additionally, other errors were found in the dependency graph. Turn --disable off for more details."
+          ]
+      (libsExes, tests) = go ([], []) rangeErrors
+        where
+          go :: ([RangeErrorData], [RangeErrorData]) -> [RangeErrorData] -> ([RangeErrorData], [RangeErrorData])
+          go (libs, ts) [] = (libs, ts)
+          go (libs, ts) (d@(RangeErrorData _ _ _ _ DepBounds{..}) : t) = go (libs', ts') t
+            where
+              libs'
+                | Set.null . Set.intersection dbComponents $ Set.fromList [CompLibrary, CompExecutable] = libs
+                | otherwise = d : libs
+              ts'
+                | Set.null . Set.intersection dbComponents $ Set.fromList [CompTestSuite, CompBenchmark] = ts
+                | otherwise = d : ts
+
+
+disableConstraint :: RangeErrorData -> Text
+disableConstraint RangeErrorData{..} = _
 
 snapshotVersion :: PackageLocationImmutable -> Maybe Version
 snapshotVersion (PLIHackage (PackageIdentifier _ v) _ _) = Just v
